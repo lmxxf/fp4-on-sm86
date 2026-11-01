@@ -1,75 +1,55 @@
-# fp4-on-sm86：在没有原生 FP4 的显卡（RTX 3080 `sm_86`）上剖析并实测 `HINT4` 方案
+# fp4-on-sm86
 
-本仓库是微信公众号 **「老靳的 AI 学习笔记」第 357 期**《【AI量化】老显卡没有 FP4 怎么办？把浮点乘以 2 塞进 INT8：剖析并实测 secemp 的 HINT4 方案》的配套开源实验与反汇编数据仓库。
+[English](#fp4-on-sm86) | **[中文说明](./README_zh.md)**
 
-针对独立研究者 `secemp` 发表的技术报告《[Towards a hardware-invariant NVFP4 for GPUs without FP4: progress report 1](https://secemp.blog/2026/10/13/hardware-invariant-nvfp4-progress-report-1/)》（2026-10-13），我们在 **NVIDIA GeForce RTX 3080 Laptop GPU（`sm_86` Ampere 架构）** 上编写了独立的反汇编普查脚本、数值模拟评估与 Triton 分项计时原型，系统验证并拆解了三个核心问题：
-1. **为什么跨四代显卡（`sm_80` 至 `sm_120`）不能用 4-bit 整数指令 `mma.s4`，最后只能选 `mma.s8`（`INT8`）？**
-2. **把 `NVFP4 (E2M1)` 乘以 2 塞进 `INT8` 的“双网格（Dual Grid）”与“两级整数缩放（Two-Level, TL）”在真实模型权重上表现如何？为什么近高斯分布的静态权重不加 Hadamard 旋转反而更好？**
-3. **解开原作者留下的速度悬念：为什么在 `M=1`（单字解码）时比 `FP16` 快近一倍，一到 `M=8`（小批量并行）却反输给 `FP16`？**
+Independent mechanistic analysis, PTX/SASS disassembly census, numerical fake-quantization evaluation, and Triton W4A8/GEMV kernel benchmarks for `secemp`'s **HINT4** (*Towards a hardware-invariant NVFP4 for GPUs without FP4: progress report 1*, 2026-10-13), executed on an **NVIDIA GeForce RTX 3080 Laptop GPU (`sm_86`, Ampere)**.
 
----
+## Files
 
-## 仓库文件清单
+- [`exp1_numerics_and_census.py`](./exp1_numerics_and_census.py) / [`exp1_numerics_and_census.json`](./exp1_numerics_and_census.json):
+  1. **6-Architecture PTX $\to$ SASS Census (`sm_80` to `sm_120`, `ptxas` CUDA 12.8 `V12.8.93`, PTX `.version 8.7`)**: Compiles `mma.sync.aligned.m16n8k32.row.col.s32.s4.s4.s32` vs `.s8.s8.s32` across `sm_80`, `sm_86`, `sm_89`, `sm_90`, `sm_100`, and `sm_120`. Confirms that `sm_80/86/89` emit `1` native `IMMA.16832.S4.S4` (`0` LOP3, `0` SHF), whereas `sm_90/100/120` expand the `.s4` MMA into `2` `IMMA.16816.S8.S8` + `45` `LOP3` + `24` `SHF` (`71` related SASS instructions), while `.s8` compiles to `1` native `IMMA.16832.S8.S8` across all 6 targets.
+  2. **`Qwen/Qwen3-0.6B` Weight Kurtosis & Reconstruction SNR (35 Matrices across 5 Layers)**: Evaluates single-grid `NVFP4`, single-grid symmetric `INT4` (with and without scale search), `HINT4` Dual-Grid (`INT4` vs `FP4*2 = {0, ±1, ±2, ±3, ±4, ±6, ±8, ±12}` sharing a unified per-tensor scale), and a Two-Level (`TL`, `K=32` shared E4M3 scale + `m in 1..8` integer sub-block multipliers) prototype, plus short-text BF16 fake-quantization perplexity and per-token KL divergence.
+- [`exp2_speed_paradox.py`](./exp2_speed_paradox.py) / [`exp2_speed_paradox.json`](./exp2_speed_paradox.json):
+  - Implements a custom 5.5-bit Dual-Grid + Two-Level `W4A8` Triton prototype (packing 2 nibbles per byte + per-subblock dual-grid flag & multiplier `m in 1..8` + E4M3-quantized shared scale per 32 weights pre-decoded to FP32), paired with a fused Triton dynamic INT8 activation quantizer, a dedicated group-16 INT4 `M=1` GEMV baseline, and `torch._int_mm` (`cuBLAS INT8`), with strict `cosine_sim > 0.9999` and `rel_l2_err < 0.005` verification on both `M=1` and `W4A8` paths.
+- [`gen_svgs.py`](./gen_svgs.py): Generates `dual-grid-tl-mechanism.svg`, `sass-s4-vs-s8-census.svg`, and `m8-speed-paradox-breakdown.svg`.
 
-- [`exp1_numerics_and_census.py`](./exp1_numerics_and_census.py) / [`exp1_numerics_and_census.json`](./exp1_numerics_and_census.json)：
-  1. **六代架构 PTX $\to$ SASS 机器码普查（`sm_80` 至 `sm_120`，`ptxas` CUDA 12.8 `V12.8.93`，PTX `.version 8.7`）**：编译并反汇编 `mma.sync.aligned.m16n8k32.row.col.s32.s4.s4.s32` 与 `.s8.s8.s32`。实测证实 30/40 系（`sm_80/86/89`）生成 `1` 条原生 `IMMA.16832.S4.S4`（`0` LOP3，`0` SHF）；而 H100/B200/RTX 50 系（`sm_90/100/120`）已移除硬件 `INT4` 单元，`ptxas` 在后台将其展开为 **`2` 条 `IMMA.16816.S8.S8` + `45` 条 `LOP3` + `24` 条 `SHF`（共 71 条相关 SASS 指令）**；唯有 `.s8` 在全部六代架构上均为 `1` 条原生 `IMMA.16832.S8.S8`。
-  2. **`Qwen/Qwen3-0.6B` 真实权重峰度（Kurtosis）与重构信噪比（SNR）评测**：在 28 层上统计 7 类线性层权重的峰度，并在 5 个代表层共 35 个矩阵上评测单网格 `NVFP4`、单网格对称 `INT4`（直转与缩放搜索）、`HINT4` 双网格（`INT4` vs `FP4×2 = {0, ±1, ±2, ±3, ±4, ±6, ±8, ±12}`）、两级缩放（`TL`，`K=32` 共享缩放 + `1..8` 整数子块倍率）原型，以及短文 `BF16` 模拟量化（Fake-Quant）困惑度与每词元 KL 散度。
-- [`exp2_speed_paradox.py`](./exp2_speed_paradox.py) / [`exp2_speed_paradox.json`](./exp2_speed_paradox.json)：
-  - 在 RTX 3080 Laptop（`sm_86`）上实现了通过严格数值校验（与各自反量化参考矩阵乘余弦相似度 `> 0.9999`、相对 L2 误差 `< 0.0003`）的两套核函数：针对 `M=1` 的 16 权重分块 `4-bit GEMV` 解码核基线（驻留 `5.0 bit/权重`），以及包含 **4-bit 打包读取 + 双网格解码 + `1..8` 子块整数倍率 + 每 32 个数共享缩放** 的 `W4A8` Triton 原型核（驻留 `5.5 bit/权重`，配套单核融合的 Triton 动态 `INT8` 激活量化核），并用三个连续 CUDA Event（`e0 -> e1 -> e2`）在 `M = 1..1024` 上精确拆解分段耗时。
-- [`gen_svgs.py`](./gen_svgs.py)：生成配套原理与实测图表 [`sass-s4-vs-s8-census.svg`](./sass-s4-vs-s8-census.svg)、[`dual-grid-tl-mechanism.svg`](./dual-grid-tl-mechanism.svg)、[`m8-speed-paradox-breakdown.svg`](./m8-speed-paradox-breakdown.svg)。
+## Key Results Summary
 
----
+### 1. PTX `.s4` vs `.s8` SASS Disassembly Census (`ptxas` V12.8.93)
 
-## 核心实测结果速览
-
-### 1. 六代架构 PTX `.s4` vs `.s8` 反汇编统计（`ptxas V12.8.93`）
-
-| 目标架构（代表显卡） | PTX `mma.m16n8k32.s4` 编译出的核心 SASS 指令 | PTX `mma.m16n8k32.s8` 编译出的核心 SASS 指令 |
+| Target Architecture | `mma.m16n8k32.s4` SASS Output | `mma.m16n8k32.s8` SASS Output |
 |---|---|---|
-| `sm_80`（A100）/ `sm_86`（RTX 30 系）/ `sm_89`（RTX 40 系） | `1` 条 `IMMA.16832.S4.S4`（`0` LOP3，`0` SHF） | `1` 条 `IMMA.16832.S8.S8`（`0` LOP3，`0` SHF） |
-| `sm_90`（H100）/ `sm_100`（B200）/ `sm_120`（RTX 50 系） | **`2` 条 `IMMA.16816.S8.S8` + `45` LOP3 + `24` SHF** | `1` 条 `IMMA.16832.S8.S8`（`0` LOP3，`0` SHF） |
+| `sm_80` / `sm_86` / `sm_89` | `1` `IMMA.16832.S4.S4` (`0` LOP3, `0` SHF) | `1` `IMMA.16832.S8.S8` (`0` LOP3, `0` SHF) |
+| `sm_90` / `sm_100` / `sm_120` | **`2` `IMMA.16816.S8.S8` + `45` LOP3 + `24` SHF** | `1` `IMMA.16832.S8.S8` (`0` LOP3, `0` SHF) |
 
-### 2. `Qwen3-0.6B` 35 个权重矩阵重构信噪比（SNR）与短文模拟量化实测（`T=152` 词元）
+### 2. `Qwen3-0.6B` Reconstruction SNR (35 Matrices) & Short-Text Fake-Quant Eval (`T=152` tokens)
 
-| 模拟量化方案（BF16 Fake-Quant） | 35 矩阵平均 SNR（↑） | 每词元平均 KL 散度（↓） | 测试短文困惑度 PPL（↓） |
+| Scheme | 35-Matrix Mean SNR (dB) | Mean Per-Token KL | Short-Text PPL (BF16 Fake-Quant) |
 |---|---:|---:|---:|
-| `BF16` 原始基准 | $\infty$ | `0.0000` | `56.55` |
-| `NVFP4` 单网格（直转 / 缩放搜索） | `20.46` / `21.31 dB` | 直转：`0.1714` | 直转：`68.09` |
-| `INT4` 对称单网格（直转 / 缩放搜索） | `21.14` / `21.53 dB` | `0.2016` / `0.2004` | **`65.24`** / `67.62` |
-| `INT4` + Hadamard 旋转（`W4A16` 模拟） | `21.29 dB` | `0.2297` | `71.47`（反升恶化） |
-| `HINT4` 双网格（直转 / 缩放搜索，`W4A16` 模拟） | `21.44` / **`22.44 dB`** | 搜索：**`0.1399`** | 搜索：`67.59` |
-| `HINT4` 双网格（`W4A8` 模拟，含激活 INT8） | `22.44 dB` | `0.1796` | `67.25` |
-| `HINT4 TL` 两级缩放原型（`K=32`，`W4A8` 模拟） | `21.73 dB` | `0.2046` | `72.43` |
-| `HINT4 TL` 原型 + `o_proj` 单独保 `W8` | **`25.16 dB`** | `0.1911` | `71.20` |
+| `BF16` Baseline | $\infty$ | `0.0000` | `56.55` |
+| `NVFP4` Single-Grid (R2N / Scale Search) | `20.46` / `21.31 dB` | R2N: `0.1714` | R2N: `68.09` |
+| `INT4` Single-Grid (R2N / Scale Search) | `21.14` / `21.53 dB` | `0.2016` / `0.2004` | **`65.24`** / `67.62` |
+| `INT4` + Hadamard Rotation (`W4A16` Sim) | `21.29 dB` | `0.2297` | `71.47` |
+| `HINT4` Dual-Grid (R2N / Scale Search, `W4A16` Sim) | `21.44` / **`22.44 dB`** | Search: **`0.1399`** | Search: `67.59` |
+| `HINT4` Dual-Grid (`W4A8` Sim) | `22.44 dB` | `0.1796` | `67.25` |
+| `HINT4 TL` Prototype (`K=32`, `W4A8` Sim) | `21.73 dB` | `0.2046` | `72.43` |
+| `HINT4 TL` Prototype + `o_proj` Kept at `W8` | **`25.16 dB`** | `0.1911` | `71.20` |
 
-### 3. RTX 3080 Laptop（`sm_86`）矩阵乘法分段计时（`[N=11008, K=4096]`）
+### 3. RTX 3080 Laptop (`sm_86`) Split Timings (`[N=11008, K=4096]`)
 
-| 批量维度 `M` | `FP16 cuBLAS` 基准 | `M=1` 走 `4-bit GEMV` 基线 | 第 4 列：`W4A8` 激活量化 | 第 5 列：双网格+两级缩放 `W4A8` 纯内核 | 第 6 列：`W4A8` 总耗时（第 4+5 列，相对 `FP16`） | 纯 `cuBLAS INT8`（真 `W8A8` 参考） | 相对 L2 误差 |
+| Batch `M` | `FP16 cuBLAS` | Group-16 `4-bit GEMV` (`M=1`) | Col 4: `W4A8` ActQuant | Col 5: Dual-Grid+TL `W4A8` Kernel | Col 6: `W4A8` Total (`4+5`, vs `FP16`) | `cuBLAS INT8` (`W8A8`) | `rel_l2_err` |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `M=1`（单字解码） | `230.40 μs` | **`132.10 μs`（快 `1.74×`）** | `9.22 μs` | `321.54 μs` | `330.76 μs`（反慢 `0.70×`） | `115.71 μs` | `0.000206` |
-| `M=8`（小批并行） | **`228.35 μs`** | — | `6.14 μs` | `315.39 μs` | `321.53 μs`（反慢 `0.71×`） | `115.71 μs` | `0.000208` |
-| `M=16` | **`230.40 μs`** | — | `5.12 μs` | `332.80 μs` | `337.92 μs`（反慢 `0.68×`） | `115.71 μs` | `0.000207` |
-| `M=32` | **`225.28 μs`** | — | `8.19 μs` | `330.75 μs` | `338.94 μs`（反慢 `0.66×`） | `116.74 μs` | `0.000208` |
-| `M=256`（长文预填） | **`637.95 μs`** | — | `12.29 μs` | `1591.30 μs` | `1603.59 μs`（反慢 `0.40×`） | `224.26 μs`（快 `2.84×`） | `0.000207` |
-| `M=1024` | **`2617.34 μs`** | — | `31.74 μs` | `6345.73 μs` | `6377.47 μs`（反慢 `0.41×`） | `898.05 μs`（快 `2.91×`） | `0.000207` |
+| `M=1` | `230.40 μs` | **`132.10 μs` (`1.74×`)** | `9.22 μs` | `321.54 μs` | `330.76 μs` (`0.70×`) | `115.71 μs` | `0.000206` |
+| `M=8` | **`228.35 μs`** | — | `6.14 μs` | `315.39 μs` | `321.53 μs` (`0.71×`) | `115.71 μs` | `0.000208` |
+| `M=16` | **`230.40 μs`** | — | `5.12 μs` | `332.80 μs` | `337.92 μs` (`0.68×`) | `115.71 μs` | `0.000207` |
+| `M=32` | **`225.28 μs`** | — | `8.19 μs` | `330.75 μs` | `338.94 μs` (`0.66×`) | `116.74 μs` | `0.000208` |
+| `M=256` | **`637.95 μs`** | — | `12.29 μs` | `1591.30 μs` | `1603.59 μs` (`0.40×`) | `224.26 μs` (`2.84×`) | `0.000207` |
+| `M=1024` | **`2617.34 μs`** | — | `31.74 μs` | `6345.73 μs` | `6377.47 μs` (`0.41×`) | `898.05 μs` (`2.91×`) | `0.000207` |
 
----
-
-## 复现运行方法
+## Reproduction
 
 ```bash
-# 1. 运行六代架构 PTX -> SASS 反汇编普查与 Qwen3-0.6B 精度测试
 python3 exp1_numerics_and_census.py
-
-# 2. 运行 RTX 3080 (sm_86) M=1..1024 分段计时与数值校验
 python3 exp2_speed_paradox.py
-
-# 3. 生成配套 SVG 图表
 python3 gen_svgs.py
 ```
-
----
-
-## English Summary
-
-Independent mechanistic analysis, 6-architecture PTX/SASS disassembly census (`sm_80` to `sm_120`), `Qwen3-0.6B` numerical fake-quantization evaluation, and RTX 3080 Laptop (`sm_86`) Triton split-timing benchmarks for `secemp`'s **HINT4** (*Towards a hardware-invariant NVFP4 for GPUs without FP4: progress report 1*). See [`exp1_numerics_and_census.json`](./exp1_numerics_and_census.json) and [`exp2_speed_paradox.json`](./exp2_speed_paradox.json) for full machine-readable results.
