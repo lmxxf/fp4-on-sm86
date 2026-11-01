@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Experiment 1 & 2 for WeChat Issue 357:
-Verifying secemp's HINT4 (Hardware-Invariant NVFP4 via INT8 Tensor Cores):
-1. PTX / SASS census across sm_80, sm_86, sm_89, sm_90, sm_100, sm_120 (proving sm_90/100/120 drop native .s4 IMMA)
-2. Dual-Grid (INT4 vs FP4*2={0,1,2,3,4,6,8,12} fitting in INT8, flag in E4M3 sign bit)
-3. Two-Level (TL: 2x16 weights sharing 1 E4M3 scale + 1..8 integer sub-scale for K=32 mma.s8)
-4. Kurtosis & Hadamard Rotation test on real Qwen3-0.6B weights (why near-Gaussian weights don't need rotation)
-5. Layer sensitivity & W8 o_proj recovery on real Qwen3-0.6B forward / perplexity / KL
+Experiment 1 for WeChat Issue 357:
+1. PTX / SASS census across sm_80, sm_86, sm_89, sm_90, sm_100, sm_120 (recording full IMMA lines & ptxas version)
+2. Dual-Grid (INT4 vs FP4*2={0,1,2,3,4,6,8,12} fitting in INT8, with single-grid scale-search controls)
+3. Two-Level (TL: 2x16 weights sharing 1 E4M3 scale + 1..8 integer sub-block multipliers for K=32 mma.s8)
+4. Kurtosis & Hadamard Rotation test on real Qwen3-0.6B weights + synthetic Gaussian/outlier tensors
+5. Layer sensitivity & W8 o_proj recovery on Qwen3-0.6B (reporting per-token mean KL and mixed SNR)
 """
 import json
 import math
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -23,17 +23,13 @@ OUT_DIR = Path(__file__).resolve().parent
 # Positive E2M1 magnitudes: 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
 E2M1_POS = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=DEVICE)
 E2M1_GRID = torch.cat([-E2M1_POS.flip(0)[:-1], E2M1_POS])  # 15 unique values
-# Doubled E2M1: 0, 1, 2, 3, 4, 6, 8, 12 -> exact integers!
+# Doubled E2M1: 0, +-1, +-2, +-3, +-4, +-6, +-8, +-12 -> exact integers!
 E2M1_X2_GRID = E2M1_GRID * 2.0
 # Symmetric INT4 grid: -7 .. +7
 INT4_GRID = torch.arange(-7, 8, dtype=torch.float32, device=DEVICE)
 
 
 def round_to_e4m3_with_global(x: torch.Tensor, global_scale: float, round_up: bool = False) -> torch.Tensor:
-    """
-    NVFP4 / HINT4 uses a per-tensor FP32 global scale + per-block E4M3 scale!
-    Without the per-tensor FP32 scale, small weights ~0.01 underflow E4M3's minimum normal 2^-6.
-    """
     scaled = x / global_scale
     x_clamped = torch.clamp(scaled, min=2**-9, max=448.0)
     s_fp8 = x_clamped.to(torch.float8_e4m3fn).to(torch.float32)
@@ -46,9 +42,9 @@ def round_to_e4m3_with_global(x: torch.Tensor, global_scale: float, round_up: bo
     return torch.clamp(s_fp8 * global_scale, min=1e-12)
 
 
-def quantize_blocks_grid(w_blocks: torch.Tensor, grid: torch.Tensor, max_val: float, search_scale: bool = False, round_up: bool = False):
+def quantize_blocks_grid(w_blocks: torch.Tensor, grid: torch.Tensor, max_val: float, search_scale: bool = False, round_up: bool = False, global_s_override: float = None):
     absmax = w_blocks.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
-    global_s = (absmax.max().item() / max_val) / 224.0  # Map tensor peak to E4M3 ~224.0
+    global_s = global_s_override if global_s_override is not None else (absmax.max().item() / max_val) / 224.0
     if global_s < 1e-12:
         global_s = 1.0
     if not search_scale:
@@ -77,8 +73,14 @@ def quantize_blocks_grid(w_blocks: torch.Tensor, grid: torch.Tensor, max_val: fl
 
 
 def quantize_dual_grid(w_blocks: torch.Tensor, search_scale: bool = True):
-    q_int4, s_int4, hat_int4 = quantize_blocks_grid(w_blocks, INT4_GRID, 7.0, search_scale=search_scale, round_up=True)
-    q_fp4x2, s_fp4x2, hat_fp4x2 = quantize_blocks_grid(w_blocks, E2M1_X2_GRID, 12.0, search_scale=search_scale, round_up=True)
+    """
+    Uses a single unified per-tensor global_s (mapped so both INT4 /7 and FP4*2 /12 fit in E4M3)
+    plus 1-bit sign flag in the per-block E4M3 byte.
+    """
+    absmax = w_blocks.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+    shared_global_s = (absmax.max().item() / 7.0) / 224.0
+    q_int4, s_int4, hat_int4 = quantize_blocks_grid(w_blocks, INT4_GRID, 7.0, search_scale=search_scale, round_up=True, global_s_override=shared_global_s)
+    q_fp4x2, s_fp4x2, hat_fp4x2 = quantize_blocks_grid(w_blocks, E2M1_X2_GRID, 12.0, search_scale=search_scale, round_up=True, global_s_override=shared_global_s)
     err_int4 = ((w_blocks - hat_int4) ** 2).sum(dim=-1, keepdim=True)
     err_fp4 = ((w_blocks - hat_fp4x2) ** 2).sum(dim=-1, keepdim=True)
     use_fp4 = err_fp4 < err_int4
@@ -90,17 +92,18 @@ def quantize_dual_grid(w_blocks: torch.Tensor, search_scale: bool = True):
 
 def quantize_tl_two_level(w_blocks_32: torch.Tensor):
     """
-    HINT4 TL (Two-Level):
+    Two-Level (TL) prototype:
     Each pair of 16-weight groups (total 32 along K) shares ONE E4M3 scale,
-    and each 16-weight sub-block gets an integer multiplier m in {1..8}.
+    and each 16-weight sub-block selects either:
+      - INT4 grid {-7..7} with integer multiplier m in {1..8} (max |q*m| = 56 <= 127)
+      - FP4*2 grid {-12..12} with integer multiplier m in {1..8} (max |q*m| = 96 <= 127)
     """
     sub_absmax = w_blocks_32.abs().amax(dim=-1)  # [N_32, 2]
     pair_absmax = sub_absmax.amax(dim=-1, keepdim=True).clamp(min=1e-12)  # [N_32, 1]
-    global_s = (pair_absmax.max().item() / 96.0) / 224.0
+    global_s = (pair_absmax.max().item() / 56.0) / 224.0
     if global_s < 1e-12:
         global_s = 1.0
 
-    # Shared E4M3 scale for the 32-weight pair (using 12*8=96 denominator; for INT4 blocks we scale grid or test candidate shared scales)
     s_shared = round_to_e4m3_with_global(pair_absmax / 56.0, global_s, round_up=True)
 
     best_hat = torch.zeros_like(w_blocks_32)
@@ -108,18 +111,13 @@ def quantize_tl_two_level(w_blocks_32: torch.Tensor):
         w_sub = w_blocks_32[:, sub_idx, :]
         best_e = torch.full((w_sub.shape[0], 1), float("inf"), device=w_sub.device)
         best_w = torch.zeros_like(w_sub)
-        # Integer multiplier m in 1..8 for INT4 grid, or FP4*2 grid (multiplier 0 marker in header)
         for m in range(1, 9):
             for grid in [INT4_GRID, E2M1_X2_GRID]:
-                # Note: q * m is in [-96, 96] <= 127, exact signed byte!
-                s_eff = s_shared * float(m) * (7.0 / 12.0 if len(grid) == 15 and grid.max() == 12.0 else 1.0)
-                # Wait: in hardware, both sub-blocks share the exact same FP32/E4M3 scale!
-                # So s_eff is strictly s_shared * m! Let's use strictly s_shared * m:
                 s_eff_hw = s_shared * float(m)
                 norm = w_sub / s_eff_hw
                 idx = (norm.unsqueeze(-1) - grid).abs().argmin(dim=-1)
                 q = grid[idx]
-                q_widened = (q * float(m)).clamp(-127.0, 127.0)  # exact INT8 operand fed to mma.s8!
+                q_widened = (q * float(m)).clamp(-127.0, 127.0)
                 w_c = q_widened * s_shared
                 e = ((w_sub - w_c) ** 2).sum(dim=-1, keepdim=True)
                 better = e < best_e
@@ -156,6 +154,7 @@ def calc_kurtosis(w: torch.Tensor) -> float:
 def run_ptx_sass_census():
     ptxas = "/home/lmxxf/.local/lib/python3.10/site-packages/triton/backends/nvidia/bin/ptxas"
     cuobjdump = "/home/lmxxf/.local/lib/python3.10/site-packages/triton/backends/nvidia/bin/cuobjdump"
+    ptxas_ver = subprocess.check_output([ptxas, "--version"], text=True).strip().splitlines()[-1]
 
     ptx_s4 = """
 .version 8.7
@@ -198,7 +197,8 @@ def run_ptx_sass_census():
 
 .visible .entry kernel_mma_s8(
     .param .u64 out_ptr,
-    .param .u32 a0, .param .u32 a1, .param .u32 a2, .param .u32 a3,
+    .param .u32 a0, .param .u32 a1,
+    .param .u32 a2, .param .u32 a3,
     .param .u32 b0, .param .u32 b1,
     .param .u32 c0, .param .u32 c1, .param .u32 c2, .param .u32 c3
 )
@@ -227,7 +227,7 @@ def run_ptx_sass_census():
     ret;
 }}
 """
-    results = {}
+    results = {"ptxas_version": ptxas_ver}
     targets = ["sm_80", "sm_86", "sm_89", "sm_90", "sm_100", "sm_120"]
     with tempfile.TemporaryDirectory() as tmp:
         tmp_p = Path(tmp)
@@ -242,7 +242,11 @@ def run_ptx_sass_census():
                     results[t][kind] = {"error": cp.stderr.strip()}
                     continue
                 sass = subprocess.check_output([cuobjdump, "-sass", str(cubin_file)], text=True)
-                imma_only = [line.split("*/")[-1].strip() for line in sass.splitlines() if "IMMA" in line]
+                imma_only = []
+                for line in sass.splitlines():
+                    if "IMMA" in line:
+                        m = re.search(r"(IMMA[^\;]+;)", line)
+                        imma_only.append(m.group(1).strip() if m else line.strip())
                 lop3_count = sum(1 for line in sass.splitlines() if "LOP3" in line)
                 shf_count = sum(1 for line in sass.splitlines() if "SHF" in line)
                 results[t][kind] = {
@@ -268,10 +272,13 @@ def main():
     kurtosis_by_proj = {"q_proj": [], "k_proj": [], "v_proj": [], "o_proj": [], "gate_proj": [], "up_proj": [], "down_proj": []}
     snr_stats = {
         "nvfp4_r2n": [],
+        "nvfp4_opt": [],
         "int4_r2n": [],
+        "int4_opt": [],
         "hint4_dual_r2n": [],
         "hint4_dual_opt": [],
         "hint4_tl_k32": [],
+        "hint4_tl_k32_oproj_w8": [],
         "nvfp4_rot": [],
         "int4_rot": [],
         "fp4_win_ratio": [],
@@ -298,12 +305,21 @@ def main():
                 wf = w.float()
                 blocks16 = wf.reshape(-1, 16)
                 _, _, hat_nvfp4 = quantize_blocks_grid(blocks16, E2M1_GRID, 6.0, search_scale=False, round_up=False)
+                _, _, hat_nvfp4_opt = quantize_blocks_grid(blocks16, E2M1_GRID, 6.0, search_scale=True, round_up=True)
                 _, _, hat_int4 = quantize_blocks_grid(blocks16, INT4_GRID, 7.0, search_scale=False, round_up=False)
-                _, _, hat_dual_r2n, use_fp4_r2n = quantize_dual_grid(blocks16, search_scale=False)
+                _, _, hat_int4_opt = quantize_blocks_grid(blocks16, INT4_GRID, 7.0, search_scale=True, round_up=True)
+                _, _, hat_dual_r2n, _ = quantize_dual_grid(blocks16, search_scale=False)
                 _, _, hat_dual_opt, use_fp4_opt = quantize_dual_grid(blocks16, search_scale=True)
 
                 blocks32 = wf.reshape(-1, 2, 16)
                 hat_tl = quantize_tl_two_level(blocks32)
+
+                if name == "o_proj":
+                    gs = (blocks16.abs().max().item() / 127.0) / 224.0
+                    s8 = round_to_e4m3_with_global(blocks16.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / 127.0, max(gs, 1e-12), round_up=True)
+                    hat_tl_oproj = ((blocks16 / s8).round().clamp(-127, 127) * s8).reshape_as(wf)
+                else:
+                    hat_tl_oproj = hat_tl.reshape_as(wf)
 
                 w_rot64 = (wf.reshape(-1, 64) @ RH64).reshape(-1, 16)
                 _, _, hat_nvfp4_rot = quantize_blocks_grid(w_rot64, E2M1_GRID, 6.0, search_scale=False, round_up=False)
@@ -312,19 +328,22 @@ def main():
                 hat_int4_unrot = (hat_int4_rot.reshape(-1, 64) @ RH64.T).reshape_as(wf)
 
                 snr_stats["nvfp4_r2n"].append(calc_snr_db(wf, hat_nvfp4.reshape_as(wf)))
+                snr_stats["nvfp4_opt"].append(calc_snr_db(wf, hat_nvfp4_opt.reshape_as(wf)))
                 snr_stats["int4_r2n"].append(calc_snr_db(wf, hat_int4.reshape_as(wf)))
+                snr_stats["int4_opt"].append(calc_snr_db(wf, hat_int4_opt.reshape_as(wf)))
                 snr_stats["hint4_dual_r2n"].append(calc_snr_db(wf, hat_dual_r2n.reshape_as(wf)))
                 snr_stats["hint4_dual_opt"].append(calc_snr_db(wf, hat_dual_opt.reshape_as(wf)))
                 snr_stats["hint4_tl_k32"].append(calc_snr_db(wf, hat_tl.reshape_as(wf)))
+                snr_stats["hint4_tl_k32_oproj_w8"].append(calc_snr_db(wf, hat_tl_oproj))
                 snr_stats["nvfp4_rot"].append(calc_snr_db(wf, hat_nvfp4_unrot))
                 snr_stats["int4_rot"].append(calc_snr_db(wf, hat_int4_unrot))
                 snr_stats["fp4_win_ratio"].append(use_fp4_opt.float().mean().item())
 
-    summary_kurtosis = {k: round(sum(v) / len(v), 3) for k, v in kurtosis_by_proj.items()}
-    summary_snr = {k: round(sum(v) / len(v), 3) for k, v in snr_stats.items()}
+    summary_kurtosis = {k: round(sum(v) / len(v), 2) for k, v in kurtosis_by_proj.items()}
+    summary_snr = {k: round(sum(v) / len(v), 2) for k, v in snr_stats.items()}
     print("\nSummary Kurtosis across 28 layers (Gaussian = 3.0):")
     print(json.dumps(summary_kurtosis, indent=2))
-    print("\nSummary Reconstruction SNR (dB) across 35 sampled matrices:")
+    print("\nSummary Reconstruction SNR (dB) across 35 sampled matrices (5 layers x 7 projections):")
     print(json.dumps(summary_snr, indent=2))
 
     # Synthetic Heavy-Tailed vs Gaussian Tensor Test
@@ -351,10 +370,8 @@ def main():
             "int4_rotated_snr_db": round(calc_snr_db(t, (h_i4_r.reshape(-1, 64) @ RH64.T).reshape_as(t)), 2),
             "fp4_grid_win_pct": round(win_fp4.float().mean().item() * 100, 1),
         }
-    print("\nSynthetic Gaussian vs Outlier Tensor Test:")
-    print(json.dumps(synth_results, indent=2))
 
-    # Whole-Model Perplexity & KL Divergence on Qwen3-0.6B
+    # Whole-Model Fake-Quant Perplexity & Per-Token KL Divergence on Qwen3-0.6B
     eval_texts = [
         "In computer architecture, floating-point representation trades precision for dynamic range, whereas integer arithmetic provides uniform step sizes across the representable interval. When neural network weights follow a near-Gaussian distribution without heavy-tailed outliers, uniform integer grids often achieve higher signal-to-noise ratios than low-mantissa floating-point grids.",
         "Large language models rely on matrix multiplications across attention projections and feed-forward networks. During single-token autoregressive decoding, execution time on graphics processing units is primarily bottlenecked by memory bandwidth rather than arithmetic throughput, making 4-bit weight compression effective.",
@@ -362,6 +379,7 @@ def main():
     ]
     full_text = "\n\n".join(eval_texts)
     input_ids = tok(full_text, return_tensors="pt").input_ids.to(DEVICE)
+    num_tokens = int(input_ids.shape[1])
 
     with torch.no_grad():
         out_bf16 = model(input_ids, labels=input_ids)
@@ -390,6 +408,8 @@ def main():
                         _, _, hat = quantize_blocks_grid(b16, E2M1_GRID, 6.0, search_scale=False)
                     elif mode == "int4":
                         _, _, hat = quantize_blocks_grid(b16, INT4_GRID, 7.0, search_scale=False)
+                    elif mode == "int4_opt":
+                        _, _, hat = quantize_blocks_grid(b16, INT4_GRID, 7.0, search_scale=True, round_up=True)
                     elif mode == "hint4_dual":
                         _, _, hat, _ = quantize_dual_grid(b16, search_scale=True)
                     elif mode == "hint4_tl":
@@ -421,16 +441,18 @@ def main():
             logits = out.logits.float()
             log_p = F.log_softmax(logits_bf16, dim=-1)
             log_q = F.log_softmax(logits, dim=-1)
-            kl = F.kl_div(log_q, log_p, log_target=True, reduction="batchmean").item()
+            kl_sum = F.kl_div(log_q, log_p, log_target=True, reduction="batchmean").item()
+            kl_per_token = kl_sum / num_tokens
 
         for h in hooks:
             h.remove()
-        return {"ppl": round(ppl, 4), "kl_vs_bf16": round(kl, 5)}
+        return {"ppl": round(ppl, 2), "kl_per_token": round(kl_per_token, 4), "kl_sum": round(kl_sum, 2)}
 
-    model_eval = {"bf16": {"ppl": round(ppl_bf16, 4), "kl_vs_bf16": 0.0}}
+    model_eval = {"eval_token_count": num_tokens, "bf16": {"ppl": round(ppl_bf16, 2), "kl_per_token": 0.0, "kl_sum": 0.0}}
     for name, cfg in [
         ("nvfp4_w4a16", ("nvfp4", False, False)),
         ("int4_w4a16", ("int4", False, False)),
+        ("int4_opt_w4a16", ("int4_opt", False, False)),
         ("int4_rot_w4a16", ("int4_rot", False, False)),
         ("hint4_dual_w4a16", ("hint4_dual", False, False)),
         ("hint4_dual_w4a8", ("hint4_dual", False, True)),
@@ -438,18 +460,20 @@ def main():
         ("hint4_tl_w4a8_oproj_w8", ("hint4_tl", True, True)),
     ]:
         model_eval[name] = eval_quantized_model(*cfg)
-        print(f"  {name}: {model_eval[name]}")
 
-    all_out = {
-        "gpu": torch.cuda.get_device_name(0),
+    print("\nWhole-Model Fake-Quant Perplexity & KL Divergence on Qwen3-0.6B:")
+    print(json.dumps(model_eval, indent=2))
+
+    final_output = {
         "ptx_sass_census": census,
-        "qwen3_0_6b_kurtosis": summary_kurtosis,
-        "qwen3_0_6b_snr_db": summary_snr,
-        "synthetic_test": synth_results,
-        "qwen3_0_6b_eval": model_eval,
+        "qwen3_0_6b_kurtosis_28layers": summary_kurtosis,
+        "qwen3_0_6b_snr_db_35matrices": summary_snr,
+        "synthetic_gaussian_vs_outlier": synth_results,
+        "qwen3_0_6b_perplexity_and_kl": model_eval,
     }
-    (OUT_DIR / "exp1_numerics_and_census.json").write_text(json.dumps(all_out, indent=2) + "\n")
-    print("\nSaved to exp1_numerics_and_census.json")
+    out_file = OUT_DIR / "exp1_numerics_and_census.json"
+    out_file.write_text(json.dumps(final_output, indent=2) + "\n")
+    print(f"\nSaved all results to {out_file}")
 
 
 if __name__ == "__main__":

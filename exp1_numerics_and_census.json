@@ -1,10 +1,10 @@
 {
-  "gpu": "NVIDIA GeForce RTX 3080 Laptop GPU",
   "ptx_sass_census": {
+    "ptxas_version": "Build cuda_12.8.r12.8/compiler.35583870_0",
     "sm_80": {
       "s4_m16n8k32": {
         "imma_instructions": [
-          ""
+          "IMMA.16832.S4.S4 R4, R4.ROW, R6.COL, R8 ;"
         ],
         "imma_count": 1,
         "lop3_count": 0,
@@ -12,7 +12,7 @@
       },
       "s8_m16n8k32": {
         "imma_instructions": [
-          ""
+          "IMMA.16832.S8.S8 R4, R4.ROW, R2.COL, R8 ;"
         ],
         "imma_count": 1,
         "lop3_count": 0,
@@ -22,7 +22,7 @@
     "sm_86": {
       "s4_m16n8k32": {
         "imma_instructions": [
-          ""
+          "IMMA.16832.S4.S4 R4, R4.ROW, R6.COL, R8 ;"
         ],
         "imma_count": 1,
         "lop3_count": 0,
@@ -30,7 +30,7 @@
       },
       "s8_m16n8k32": {
         "imma_instructions": [
-          ""
+          "IMMA.16832.S8.S8 R4, R4.ROW, R2.COL, R8 ;"
         ],
         "imma_count": 1,
         "lop3_count": 0,
@@ -40,7 +40,7 @@
     "sm_89": {
       "s4_m16n8k32": {
         "imma_instructions": [
-          ""
+          "IMMA.16832.S4.S4 R4, R4.ROW, R6.COL, R8 ;"
         ],
         "imma_count": 1,
         "lop3_count": 0,
@@ -48,7 +48,7 @@
       },
       "s8_m16n8k32": {
         "imma_instructions": [
-          ""
+          "IMMA.16832.S8.S8 R4, R4.ROW, R2.COL, R8 ;"
         ],
         "imma_count": 1,
         "lop3_count": 0,
@@ -58,8 +58,8 @@
     "sm_90": {
       "s4_m16n8k32": {
         "imma_instructions": [
-          "",
-          ""
+          "IMMA.16816.S8.S8 R16, R6.ROW, R14.COL, RZ ;",
+          "IMMA.16816.S8.S8 R8, R8.ROW, R13.COL, RZ ;"
         ],
         "imma_count": 2,
         "lop3_count": 45,
@@ -67,7 +67,7 @@
       },
       "s8_m16n8k32": {
         "imma_instructions": [
-          ""
+          "IMMA.16832.S8.S8 R4, R4.ROW, R8.COL, R12 ;"
         ],
         "imma_count": 1,
         "lop3_count": 0,
@@ -77,8 +77,8 @@
     "sm_100": {
       "s4_m16n8k32": {
         "imma_instructions": [
-          "",
-          ""
+          "IMMA.16816.S8.S8 R4, R4.ROW, R11.COL, RZ ;",
+          "IMMA.16816.S8.S8 R8, R8.ROW, R10.COL, RZ ;"
         ],
         "imma_count": 2,
         "lop3_count": 45,
@@ -86,7 +86,7 @@
       },
       "s8_m16n8k32": {
         "imma_instructions": [
-          ""
+          "IMMA.16832.S8.S8 R4, R4.ROW, R8.COL, R12 ;"
         ],
         "imma_count": 1,
         "lop3_count": 0,
@@ -96,8 +96,8 @@
     "sm_120": {
       "s4_m16n8k32": {
         "imma_instructions": [
-          "",
-          ""
+          "IMMA.16816.S8.S8 R8, R8.ROW, R16.COL, RZ                 ?trans1;",
+          "IMMA.16816.S8.S8 R4, R6.ROW, R13.COL, RZ                 ?trans1;"
         ],
         "imma_count": 2,
         "lop3_count": 45,
@@ -105,7 +105,7 @@
       },
       "s8_m16n8k32": {
         "imma_instructions": [
-          ""
+          "IMMA.16832.S8.S8 R4, R4.ROW, R2.COL, R8 &req={0} ?trans6;"
         ],
         "imma_count": 1,
         "lop3_count": 0,
@@ -113,77 +113,94 @@
       }
     }
   },
-  "qwen3_0_6b_kurtosis": {
-    "q_proj": 7.726,
-    "k_proj": 6.048,
-    "v_proj": 3.801,
-    "o_proj": 4.256,
+  "qwen3_0_6b_kurtosis_28layers": {
+    "q_proj": 7.73,
+    "k_proj": 6.05,
+    "v_proj": 3.8,
+    "o_proj": 4.26,
     "gate_proj": 5.31,
-    "up_proj": 4.087,
-    "down_proj": 4.046
+    "up_proj": 4.09,
+    "down_proj": 4.05
   },
-  "qwen3_0_6b_snr_db": {
-    "nvfp4_r2n": 20.456,
-    "int4_r2n": 21.139,
-    "hint4_dual_r2n": 21.414,
-    "hint4_dual_opt": 22.435,
-    "hint4_tl_k32": 21.728,
-    "nvfp4_rot": 20.433,
-    "int4_rot": 21.286,
-    "fp4_win_ratio": 0.423
+  "qwen3_0_6b_snr_db_35matrices": {
+    "nvfp4_r2n": 20.46,
+    "nvfp4_opt": 21.31,
+    "int4_r2n": 21.14,
+    "int4_opt": 21.53,
+    "hint4_dual_r2n": 21.44,
+    "hint4_dual_opt": 22.44,
+    "hint4_tl_k32": 21.73,
+    "hint4_tl_k32_oproj_w8": 25.16,
+    "nvfp4_rot": 20.43,
+    "int4_rot": 21.29,
+    "fp4_win_ratio": 0.42
   },
-  "synthetic_test": {
+  "synthetic_gaussian_vs_outlier": {
     "gaussian_kurt_3": {
       "kurtosis": 3.0,
       "nvfp4_snr_db": 20.44,
       "int4_snr_db": 21.28,
-      "hint4_dual_snr_db": 22.5,
+      "hint4_dual_snr_db": 22.49,
       "nvfp4_rotated_snr_db": 20.44,
       "int4_rotated_snr_db": 21.28,
-      "fp4_grid_win_pct": 40.3
+      "fp4_grid_win_pct": 40.4
     },
     "outlier_channels": {
       "kurtosis": 94.16,
       "nvfp4_snr_db": 20.61,
       "int4_snr_db": 17.59,
-      "hint4_dual_snr_db": 21.09,
+      "hint4_dual_snr_db": 21.1,
       "nvfp4_rotated_snr_db": 20.04,
       "int4_rotated_snr_db": 22.97,
-      "fp4_grid_win_pct": 52.0
+      "fp4_grid_win_pct": 52.1
     }
   },
-  "qwen3_0_6b_eval": {
+  "qwen3_0_6b_perplexity_and_kl": {
+    "eval_token_count": 152,
     "bf16": {
-      "ppl": 56.5497,
-      "kl_vs_bf16": 0.0
+      "ppl": 56.55,
+      "kl_per_token": 0.0,
+      "kl_sum": 0.0
     },
     "nvfp4_w4a16": {
-      "ppl": 68.0897,
-      "kl_vs_bf16": 26.05033
+      "ppl": 68.09,
+      "kl_per_token": 0.1714,
+      "kl_sum": 26.05
     },
     "int4_w4a16": {
-      "ppl": 65.2371,
-      "kl_vs_bf16": 30.64404
+      "ppl": 65.24,
+      "kl_per_token": 0.2016,
+      "kl_sum": 30.64
+    },
+    "int4_opt_w4a16": {
+      "ppl": 67.62,
+      "kl_per_token": 0.2004,
+      "kl_sum": 30.46
     },
     "int4_rot_w4a16": {
-      "ppl": 71.4719,
-      "kl_vs_bf16": 34.92056
+      "ppl": 71.47,
+      "kl_per_token": 0.2297,
+      "kl_sum": 34.92
     },
     "hint4_dual_w4a16": {
-      "ppl": 69.562,
-      "kl_vs_bf16": 21.73278
+      "ppl": 67.59,
+      "kl_per_token": 0.1399,
+      "kl_sum": 21.26
     },
     "hint4_dual_w4a8": {
-      "ppl": 72.5591,
-      "kl_vs_bf16": 25.63987
+      "ppl": 67.25,
+      "kl_per_token": 0.1796,
+      "kl_sum": 27.31
     },
     "hint4_tl_w4a8": {
-      "ppl": 65.3408,
-      "kl_vs_bf16": 29.69285
+      "ppl": 72.43,
+      "kl_per_token": 0.2046,
+      "kl_sum": 31.1
     },
     "hint4_tl_w4a8_oproj_w8": {
-      "ppl": 64.4618,
-      "kl_vs_bf16": 27.17719
+      "ppl": 71.2,
+      "kl_per_token": 0.1911,
+      "kl_sum": 29.05
     }
   }
 }
